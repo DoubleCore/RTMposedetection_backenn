@@ -14,6 +14,7 @@ import logging
 
 from models.rtmpose.detector import get_rtmpose_detector
 from utils.exceptions import ProcessingError
+from utils.video_processor import get_frame_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +33,16 @@ class SimpleFileHandler:
         self.output_dir = output_dir
         self.json_dir = os.path.join(output_dir, "json")
         self.images_dir = os.path.join(output_dir, "images")
+        self.origin_dir = os.path.join(output_dir, "origin")
         self.temp_dir = os.path.join(output_dir, "temp")
         
         # 创建输出目录
-        for dir_path in [self.output_dir, self.json_dir, self.images_dir, self.temp_dir]:
+        for dir_path in [self.output_dir, self.json_dir, self.images_dir, self.origin_dir, self.temp_dir]:
             os.makedirs(dir_path, exist_ok=True)
         
-        # 获取RTMPose检测器
+        # 获取RTMPose检测器和视频帧提取器
         self.detector = get_rtmpose_detector()
+        self.frame_extractor = get_frame_extractor(output_dir)
         
         logger.info(f"简化文件处理器初始化完成，输出目录: {output_dir}")
     
@@ -107,7 +110,7 @@ class SimpleFileHandler:
             
             # 绘制并保存标注图片
             annotated_image = self.detector.draw_pose_on_image(image, keypoints, scores)
-            annotated_filename = f"{task_id}_annotated.jpg"
+            annotated_filename = f"{task_id}_frame1.jpg"
             annotated_path = os.path.join(self.images_dir, annotated_filename)
             cv2.imwrite(annotated_path, annotated_image)
             
@@ -128,7 +131,7 @@ class SimpleFileHandler:
     
     async def process_video_file(self, file_path: str, task_id: str, filename: str) -> Dict[str, Any]:
         """
-        处理视频文件（简化版本，处理多帧）
+        处理视频文件（新流程：先提取帧→再进行姿态检测）
         
         Args:
             file_path: 视频文件路径
@@ -141,102 +144,102 @@ class SimpleFileHandler:
         try:
             logger.info(f"🎥 开始处理视频: {filename}")
             
-            # 打开视频
-            cap = cv2.VideoCapture(file_path)
-            if not cap.isOpened():
-                raise ProcessingError("无法打开视频文件")
+            # 第一步：提取视频帧到 origin 目录
+            logger.info("📸 第一步：提取视频帧到原始目录...")
+            extraction_result = self.frame_extractor.extract_frames(
+                video_path=file_path,
+                task_id=task_id,
+                max_frames=20,
+                sample_method="uniform"
+            )
             
-            # 获取视频信息
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            duration = frame_count / fps if fps > 0 else 0
+            extracted_frames = extraction_result["extracted_frames"]
+            video_info = extraction_result["video_info"]
             
-            logger.info(f"📊 视频信息: {frame_count}帧, {fps}FPS, {width}x{height}, {duration:.2f}秒")
+            logger.info(f"✅ 帧提取完成: 提取了 {len(extracted_frames)} 帧到 origin 目录")
             
-            # 采样帧进行处理（每10帧处理一次）
-            sample_interval = max(1, frame_count // 20)  # 最多处理20帧
+            # 第二步：对提取的帧进行姿态检测
+            logger.info("🤖 第二步：对原始帧进行姿态检测...")
+            
             processed_frames = []
             annotated_images = []
-            
-            frame_idx = 0
             total_persons = 0
             
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            for frame_info in extracted_frames:
+                frame_path = frame_info["file_path"]
+                frame_number = frame_info["frame_number"]
+                original_frame_index = frame_info["original_frame_index"]
+                timestamp = frame_info["timestamp"]
                 
-                # 只处理采样帧
-                if frame_idx % sample_interval == 0:
-                    try:
-                        # RTMPose姿态检测
-                        keypoints, scores = self.detector.detect_pose_simple(frame)
-                        num_persons = len(keypoints)
-                        total_persons += num_persons
-                        
-                        # 记录帧数据
-                        frame_data = {
-                            "frame_id": frame_idx,
-                            "timestamp": frame_idx / fps if fps > 0 else 0,
-                            "num_persons": num_persons,
-                            "persons": []
+                try:
+                    # 读取原始帧图像
+                    image = cv2.imread(frame_path)
+                    if image is None:
+                        logger.warning(f"⚠️ 无法读取帧图像: {frame_path}")
+                        continue
+                    
+                    # RTMPose姿态检测
+                    keypoints, scores = self.detector.detect_pose_simple(image)
+                    num_persons = len(keypoints)
+                    total_persons += num_persons
+                    
+                    # 记录帧数据
+                    frame_data = {
+                        "frame_number": frame_number,
+                        "original_frame_index": original_frame_index,
+                        "timestamp": timestamp,
+                        "num_persons": num_persons,
+                        "origin_image": frame_info["filename"],
+                        "persons": []
+                    }
+                    
+                    # 添加人员数据
+                    for person_idx in range(num_persons):
+                        person_data = {
+                            "person_id": person_idx,
+                            "keypoints": keypoints[person_idx].tolist(),
+                            "scores": scores[person_idx].tolist(),
+                            "skeleton_format": "COCO17",
+                            "keypoint_names": self.detector.keypoint_names,
+                            "avg_confidence": float(np.mean(scores[person_idx]))
                         }
-                        
-                        # 添加人员数据
-                        for person_idx in range(num_persons):
-                            person_data = {
-                                "person_id": person_idx,
-                                "keypoints": keypoints[person_idx].tolist(),
-                                "scores": scores[person_idx].tolist(),
-                                "avg_confidence": float(np.mean(scores[person_idx]))
-                            }
-                            frame_data["persons"].append(person_data)
-                        
-                        processed_frames.append(frame_data)
-                        
-                        # 保存标注图片（前几帧）
-                        if len(annotated_images) < 5:
-                            annotated_frame = self.detector.draw_pose_on_image(frame, keypoints, scores)
-                            annotated_filename = f"{task_id}_frame_{frame_idx}.jpg"
-                            annotated_path = os.path.join(self.images_dir, annotated_filename)
-                            cv2.imwrite(annotated_path, annotated_frame)
-                            annotated_images.append(annotated_filename)
-                        
-                        logger.info(f"处理帧 {frame_idx}: 检测到 {num_persons} 个人")
-                        
-                    except Exception as e:
-                        logger.warning(f"处理帧 {frame_idx} 失败: {str(e)}")
-                
-                frame_idx += 1
-            
-            cap.release()
+                        frame_data["persons"].append(person_data)
+                    
+                    processed_frames.append(frame_data)
+                    
+                    # 保存标注图片
+                    annotated_frame = self.detector.draw_pose_on_image(image, keypoints, scores)
+                    annotated_filename = f"{task_id}_frame{frame_number}.jpg"
+                    annotated_path = os.path.join(self.images_dir, annotated_filename)
+                    cv2.imwrite(annotated_path, annotated_frame)
+                    annotated_images.append(annotated_filename)
+                    
+                    logger.info(f"✅ 处理帧 {frame_number}: 检测到 {num_persons} 个人 (原始帧号: {original_frame_index})")
+                    
+                except Exception as e:
+                    logger.error(f"❌ 处理帧 {frame_number} 失败: {str(e)}")
+                    continue
             
             # 创建JSON结果
             json_result = {
                 "task_id": task_id,
                 "file_name": filename,
                 "file_type": "video",
-                "video_info": {
-                    "frame_count": frame_count,
-                    "fps": fps,
-                    "duration": duration,
-                    "resolution": {
-                        "width": width,
-                        "height": height
-                    }
-                },
+                "video_info": video_info,
+                "extraction_info": extraction_result["extraction_info"],
                 "analysis_time": datetime.now().isoformat(),
                 "processed_frames": len(processed_frames),
-                "sample_interval": sample_interval,
                 "total_persons_detected": total_persons,
                 "model_info": {
                     "model_name": self.detector.model_name,
                     "mode": self.detector.mode,
                     "confidence_threshold": self.detector.confidence_threshold
                 },
-                "frames": processed_frames
+                "frames": processed_frames,
+                "file_structure": {
+                    "origin_frames": [f["filename"] for f in extracted_frames],
+                    "annotated_frames": annotated_images
+                }
             }
             
             # 保存JSON结果
@@ -244,15 +247,18 @@ class SimpleFileHandler:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(json_result, f, indent=2, ensure_ascii=False)
             
-            logger.info(f"✅ 视频处理完成: JSON={json_path}, 处理了{len(processed_frames)}帧")
+            logger.info(f"✅ 视频处理完成: JSON={json_path}")
+            logger.info(f"📁 原始帧数: {len(extracted_frames)}, 标注帧数: {len(annotated_images)}")
             
             return {
                 "type": "video",
-                "video_info": json_result["video_info"],
+                "video_info": video_info,
+                "extraction_info": extraction_result["extraction_info"],
                 "processed_frames": len(processed_frames),
                 "total_persons_detected": total_persons,
                 "json_file": f"{task_id}.json",
                 "annotated_images": annotated_images,
+                "origin_images": [f["filename"] for f in extracted_frames],
                 "processing_time": f"{len(processed_frames)} frames processed",
                 "results": json_result
             }
@@ -273,15 +279,27 @@ class SimpleFileHandler:
         """
         json_path = os.path.join(self.json_dir, f"{task_id}.json")
         
-        # 查找相关的图片文件
-        image_files = []
+        # 查找标注图片文件
+        annotated_files = []
         for filename in os.listdir(self.images_dir):
             if filename.startswith(task_id):
-                image_files.append(filename)
+                annotated_files.append(filename)
+        
+        # 查找原始帧文件
+        origin_files = []
+        for filename in os.listdir(self.origin_dir):
+            if filename.startswith(task_id):
+                origin_files.append(filename)
+        
+        # 按帧号排序
+        annotated_files.sort(key=lambda x: int(x.split('frame')[1].split('.')[0]) if 'frame' in x else 0)
+        origin_files.sort(key=lambda x: int(x.split('frame')[1].split('.')[0]) if 'frame' in x else 0)
         
         return {
             "json_file": json_path if os.path.exists(json_path) else None,
-            "image_files": image_files
+            "annotated_images": annotated_files,
+            "origin_images": origin_files,
+            "total_files": len(annotated_files) + len(origin_files) + (1 if os.path.exists(json_path) else 0)
         }
     
     def cleanup_temp_files(self, max_age_hours: int = 24):

@@ -66,6 +66,7 @@ for dir_path in [OUTPUT_DIR, UPLOAD_DIR, TEMP_DIR]:
 
 # 静态文件服务
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
+app.mount("/origin", StaticFiles(directory=os.path.join(OUTPUT_DIR, "origin")), name="origin")
 
 # 获取处理器实例
 file_handler = get_file_handler(OUTPUT_DIR)
