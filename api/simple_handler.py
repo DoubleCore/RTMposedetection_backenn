@@ -9,7 +9,7 @@ import os
 import json
 import uuid
 from datetime import datetime
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 import logging
 
 from models.rtmpose.detector import get_rtmpose_detector
@@ -261,7 +261,7 @@ class SimpleFileHandler:
             logger.error(f"视频处理失败: {str(e)}")
             raise ProcessingError(f"视频处理失败: {str(e)}")
     
-    def get_result_files(self, task_id: str) -> Dict[str, str]:
+    def get_result_files(self, task_id: str) -> Dict[str, Any]:
         """
         获取任务的结果文件路径
         
