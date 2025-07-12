@@ -42,7 +42,7 @@ class RTMPoseDetector:
         
         self.model_name = model_name
         self.mode = mode
-        self.confidence_threshold = 0.3
+        self.confidence_threshold = 0.1  # 降低置信度阈值，保存更多检测结果
         self.body_model = None
         self.keypoint_names = [
             "nose", "left_eye", "right_eye", "left_ear", "right_ear",
@@ -173,8 +173,10 @@ class RTMPoseDetector:
                 if conf > self.confidence_threshold:
                     valid_points.append((float(x), float(y)))
             
-            # 如果有效关键点太少，跳过这个人
-            if len(valid_points) < 5:
+            # 降低过滤要求：只要检测到人物就保存，不论关键点数量
+            # 原来的严格过滤：if len(valid_points) < 5: continue
+            # 现在改为更宽松的条件：只要有检测结果就保存
+            if len(valid_points) < 1:  # 至少要有1个有效关键点
                 continue
             
             # 计算边界框
@@ -224,7 +226,7 @@ class RTMPoseDetector:
                 keypoints,
                 scores,
                 openpose_skeleton=False,  # 使用COCO17格式
-                kpt_thr=self.confidence_threshold,
+                kpt_thr=0.05,  # 使用更低的阈值进行绘制，显示更多关键点
                 line_width=2
             )
         except Exception as e:

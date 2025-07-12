@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+import cv2
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
@@ -25,6 +27,7 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from api.simple_handler import get_file_handler
+from models.sam import get_sam_processor
 from utils.exceptions import ProcessingError
 
 # 配置日志
@@ -70,6 +73,7 @@ app.mount("/origin", StaticFiles(directory=os.path.join(OUTPUT_DIR, "origin")), 
 
 # 获取处理器实例
 file_handler = get_file_handler(OUTPUT_DIR)
+sam_processor = get_sam_processor(OUTPUT_DIR)  # 添加SAM处理器
 
 # 任务状态存储
 task_status: Dict[str, Dict[str, Any]] = {}
@@ -407,6 +411,308 @@ async def list_tasks():
             for task_id, data in task_status.items()
         ]
     }
+
+@app.get("/origin/{task_id}")
+async def list_origin_frames(task_id: str):
+    """
+    列出指定任务的原始帧文件
+    """
+    origin_task_dir = os.path.join(OUTPUT_DIR, "origin", task_id)
+    
+    if not os.path.exists(origin_task_dir):
+        raise HTTPException(status_code=404, detail="任务原始帧目录不存在")
+    
+    frame_files = []
+    for filename in os.listdir(origin_task_dir):
+        if filename.startswith("frame_") and filename.endswith('.jpg'):
+            frame_files.append({
+                "filename": filename,
+                "download_url": f"/origin/{task_id}/{filename}"
+            })
+    
+    # 按帧号排序
+    frame_files.sort(key=lambda x: int(x["filename"].split('_')[1].split('.')[0]))
+    
+    return {
+        "task_id": task_id,
+        "origin_frames": frame_files,
+        "total_frames": len(frame_files)
+    }
+
+@app.get("/origin/{task_id}/{filename}")
+async def download_origin_frame(task_id: str, filename: str):
+    """
+    下载指定任务的原始帧文件
+    """
+    if not filename.startswith("frame_") or not filename.endswith(".jpg"):
+        raise HTTPException(status_code=400, detail="无效的文件名格式")
+    
+    frame_path = os.path.join(OUTPUT_DIR, "origin", task_id, filename)
+    
+    if not os.path.exists(frame_path):
+        raise HTTPException(status_code=404, detail="原始帧文件不存在")
+    
+    return FileResponse(
+        frame_path,
+        media_type="image/jpeg",
+        filename=filename
+    )
+
+# ===== SAM分割相关API端点 =====
+
+@app.post("/sam/process")
+async def process_sam_segmentation(
+    background_tasks: BackgroundTasks,
+    processing_mode: str = "separate_person_pool"
+):
+    """
+    对所有pose检测结果进行人物和游泳池分离处理
+    
+    Args:
+        processing_mode: 处理模式
+            - "separate_person_pool": 分离人物和游泳池
+            - "highlight_person": 突出人物，模糊背景  
+            - "extract_person": 提取人物，透明背景
+            - "pool_only": 只保留游泳池，移除人物
+    """
+    try:
+        logger.info(f"🎯 开始人物和游泳池分离处理，模式: {processing_mode}")
+        
+        # 检查是否有pose数据可以处理
+        pose_dir = os.path.join(OUTPUT_DIR, "pose")
+        if not os.path.exists(pose_dir) or not os.listdir(pose_dir):
+            raise HTTPException(status_code=400, detail="没有找到pose检测结果，请先进行姿态检测")
+        
+        # 验证处理模式
+        valid_modes = ["separate_person_pool", "highlight_person", "extract_person", "pool_only"]
+        if processing_mode not in valid_modes:
+            raise HTTPException(status_code=400, detail=f"无效的处理模式。支持的模式: {', '.join(valid_modes)}")
+        
+        # 添加后台处理任务
+        background_tasks.add_task(process_sam_background, processing_mode)
+        
+        return {
+            "message": f"人物和游泳池分离处理已开始",
+            "processing_mode": processing_mode,
+            "status": "processing",
+            "mode_description": {
+                "separate_person_pool": "分离人物和游泳池为独立图像",
+                "highlight_person": "突出人物，模糊游泳池背景", 
+                "extract_person": "提取人物，透明背景",
+                "pool_only": "只保留游泳池，移除人物"
+            }.get(processing_mode, "")
+        }
+        
+    except Exception as e:
+        logger.error(f"启动人物和游泳池分离处理失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"启动处理失败: {str(e)}")
+
+async def process_sam_background(processing_mode: str):
+    """
+    后台人物和游泳池分离处理任务
+    """
+    try:
+        logger.info(f"🔄 开始后台人物和游泳池分离处理，模式: {processing_mode}")
+        result = sam_processor.process_all_frames(processing_mode)
+        logger.info(f"✅ 人物和游泳池分离处理完成: {result}")
+    except Exception as e:
+        logger.error(f"❌ 后台处理失败: {str(e)}")
+
+@app.get("/sam/status")
+async def get_sam_status():
+    """
+    获取人物和游泳池分离处理状态和统计信息
+    """
+    try:
+        stats = sam_processor.get_processing_stats()
+        
+        # 检查pose和origin目录的文件数量
+        pose_count = len([f for f in os.listdir(os.path.join(OUTPUT_DIR, "pose")) 
+                         if f.startswith("frame_") and f.endswith(".jpg")])
+        origin_count = len([f for f in os.listdir(os.path.join(OUTPUT_DIR, "origin")) 
+                           if f.startswith("frame_") and f.endswith(".jpg")])
+        
+        return {
+            "sam_processing": stats,
+            "input_data": {
+                "pose_images": pose_count,
+                "origin_frames": origin_count
+            },
+            "ready_for_processing": pose_count > 0,
+            "supported_modes": [
+                {
+                    "mode": "separate_person_pool",
+                    "description": "分离人物和游泳池为独立图像"
+                },
+                {
+                    "mode": "highlight_person", 
+                    "description": "突出人物，模糊游泳池背景"
+                },
+                {
+                    "mode": "extract_person",
+                    "description": "提取人物，透明背景"
+                },
+                {
+                    "mode": "pool_only",
+                    "description": "只保留游泳池，移除人物"
+                }
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"获取处理状态失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
+
+@app.get("/sam/images")
+async def list_sam_images():
+    """
+    列出所有人物和游泳池分离后的图片
+    """
+    try:
+        sam_dir = os.path.join(OUTPUT_DIR, "sam")
+        
+        if not os.path.exists(sam_dir):
+            return {"sam_images": [], "total": 0}
+        
+        # 获取不同类型的处理结果
+        image_categories = {
+            "person_only": [],
+            "pool_only": [],
+            "combined": [],
+            "highlighted_person": [],
+            "mask_visualization": [],
+            "person_extracted": []
+        }
+        
+        for filename in os.listdir(sam_dir):
+            if filename.endswith(('.jpg', '.png')):
+                frame_number_match = filename.split('_')[1] if '_' in filename else None
+                try:
+                    frame_number = int(frame_number_match) if frame_number_match else 0
+                except ValueError:
+                    frame_number = 0
+                
+                image_info = {
+                    "filename": filename,
+                    "download_url": f"/output/sam/{filename}",
+                    "frame_number": frame_number
+                }
+                
+                # 根据文件名分类
+                for category in image_categories.keys():
+                    if category in filename:
+                        image_categories[category].append(image_info)
+                        break
+        
+        # 对每个类别按帧号排序
+        for category in image_categories:
+            image_categories[category].sort(key=lambda x: x["frame_number"])
+        
+        return {
+            "image_categories": image_categories,
+            "total_by_category": {k: len(v) for k, v in image_categories.items()},
+            "total_images": sum(len(v) for v in image_categories.values())
+        }
+        
+    except Exception as e:
+        logger.error(f"列出处理结果失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"列出图片失败: {str(e)}")
+
+@app.get("/sam/comparison/{frame_number}")
+async def create_comparison_image(frame_number: int):
+    """
+    创建指定帧的处理结果对比图像
+    """
+    try:
+        sam_dir = os.path.join(OUTPUT_DIR, "sam")
+        
+        # 查找该帧的所有处理结果
+        frame_files = []
+        for filename in os.listdir(sam_dir):
+            if filename.startswith(f"frame_{frame_number}_") and filename.endswith(('.jpg', '.png')):
+                frame_files.append(filename)
+        
+        if not frame_files:
+            raise HTTPException(status_code=404, detail=f"未找到帧 {frame_number} 的处理结果")
+        
+        # 创建对比图像
+        images_to_combine = []
+        labels = []
+        
+        # 按优先级顺序加载图像
+        priority_types = ["original", "person_only", "pool_only", "combined", "mask_visualization"]
+        
+        for img_type in priority_types:
+            matching_file = next((f for f in frame_files if img_type in f), None)
+            if matching_file:
+                img_path = os.path.join(sam_dir, matching_file)
+                img = cv2.imread(img_path)
+                if img is not None:
+                    images_to_combine.append(img)
+                    labels.append(img_type.replace('_', ' ').title())
+        
+        if len(images_to_combine) < 2:
+            raise HTTPException(status_code=404, detail=f"帧 {frame_number} 的处理结果不足，无法创建对比图")
+        
+        # 调整所有图像到相同尺寸
+        target_height = 300
+        resized_images = []
+        for img in images_to_combine:
+            h, w = img.shape[:2]
+            target_width = int(w * target_height / h)
+            resized = cv2.resize(img, (target_width, target_height))
+            resized_images.append(resized)
+        
+        # 水平拼接图像
+        comparison = np.hstack(resized_images)
+        
+        # 添加标签
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        x_offset = 0
+        for i, (img, label) in enumerate(zip(resized_images, labels)):
+            cv2.putText(comparison, label, (x_offset + 10, 25), font, 0.7, (255, 255, 255), 2)
+            x_offset += img.shape[1]
+        
+        # 保存对比图像
+        comparison_filename = f"frame_{frame_number}_comparison.jpg"
+        comparison_path = os.path.join(sam_dir, comparison_filename)
+        cv2.imwrite(comparison_path, comparison)
+        
+        return {
+            "success": True,
+            "frame_number": frame_number,
+            "comparison_image": comparison_filename,
+            "download_url": f"/output/sam/{comparison_filename}",
+            "included_types": labels
+        }
+        
+    except Exception as e:
+        logger.error(f"创建对比图像失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"创建对比图像失败: {str(e)}")
+
+@app.delete("/sam/clear")
+async def clear_sam_results():
+    """
+    清理所有SAM处理结果
+    """
+    try:
+        sam_dir = os.path.join(OUTPUT_DIR, "sam")
+        
+        if os.path.exists(sam_dir):
+            import shutil
+            shutil.rmtree(sam_dir)
+            os.makedirs(sam_dir, exist_ok=True)
+        
+        logger.info("🗑️ SAM结果已清理")
+        
+        return {
+            "message": "SAM处理结果已清理",
+            "status": "success"
+        }
+        
+    except Exception as e:
+        logger.error(f"清理SAM结果失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"清理SAM结果失败: {str(e)}")
 
 if __name__ == "__main__":
     print("🚀 启动跳水姿态分析系统...")

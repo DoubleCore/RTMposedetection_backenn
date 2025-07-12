@@ -6,7 +6,7 @@
 import cv2
 import os
 import numpy as np
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -35,23 +35,27 @@ class VideoFrameExtractor:
         self, 
         video_path: str, 
         task_id: str, 
-        max_frames: int = 20,
-        sample_method: str = "uniform"
+        max_frames: Optional[int] = None,
+        sample_method: str = "all"
     ) -> Dict[str, Any]:
         """
         从视频中提取帧图像
         
         Args:
             video_path: 视频文件路径
-            task_id: 任务ID
-            max_frames: 最大提取帧数
-            sample_method: 采样方法 ("uniform", "interval")
+            task_id: 任务ID (用于创建子目录)
+            max_frames: 最大提取帧数 (None表示提取所有帧)
+            sample_method: 采样方法 ("all", "uniform", "interval")
             
         Returns:
             提取结果字典
         """
         try:
             logger.info(f"🎬 开始提取视频帧: {video_path}")
+            
+            # 为每个任务创建独立的子目录
+            task_origin_dir = os.path.join(self.origin_dir, task_id)
+            os.makedirs(task_origin_dir, exist_ok=True)
             
             # 打开视频
             cap = cv2.VideoCapture(video_path)
@@ -68,15 +72,23 @@ class VideoFrameExtractor:
             logger.info(f"📊 视频信息: {frame_count}帧, {fps}FPS, {width}x{height}, {duration:.2f}秒")
             
             # 计算采样策略
-            if sample_method == "uniform":
+            if sample_method == "all":
+                # 提取所有帧
+                sample_indices = list(range(frame_count))
+                logger.info(f"📋 采样策略: 提取所有帧 ({frame_count} 帧)")
+            elif sample_method == "uniform":
                 # 均匀采样
+                if max_frames is None:
+                    max_frames = min(50, frame_count)  # 默认最多50帧
                 sample_indices = self._calculate_uniform_sampling(frame_count, max_frames)
+                logger.info(f"📋 采样策略: 均匀采样 {len(sample_indices)} 帧")
             else:
                 # 间隔采样
+                if max_frames is None:
+                    max_frames = min(50, frame_count)  # 默认最多50帧
                 sample_interval = max(1, frame_count // max_frames)
                 sample_indices = list(range(0, frame_count, sample_interval))[:max_frames]
-            
-            logger.info(f"📋 采样策略: {sample_method}, 目标帧数: {len(sample_indices)}")
+                logger.info(f"📋 采样策略: 间隔采样 {len(sample_indices)} 帧")
             
             # 提取帧图像
             extracted_frames = []
@@ -92,9 +104,9 @@ class VideoFrameExtractor:
                 if frame_idx in sample_indices:
                     saved_count += 1
                     
-                    # 保存原始帧
-                    frame_filename = f"{task_id}_frame{saved_count}.jpg"
-                    frame_path = os.path.join(self.origin_dir, frame_filename)
+                    # 新的命名格式：frame_n.jpg (简洁命名)
+                    frame_filename = f"frame_{saved_count}.jpg"
+                    frame_path = os.path.join(task_origin_dir, frame_filename)
                     
                     # 保存图片
                     success = cv2.imwrite(frame_path, frame)
@@ -112,7 +124,11 @@ class VideoFrameExtractor:
                         }
                         extracted_frames.append(frame_info)
                         
-                        logger.info(f"📸 保存帧 {saved_count}: {frame_filename} (原始帧号: {frame_idx})")
+                        # 进度日志：每100帧打印一次，或前10帧每帧都打印
+                        if saved_count % 100 == 0:
+                            logger.info(f"📸 已保存 {saved_count} / {len(sample_indices)} 帧...")
+                        elif saved_count <= 10:
+                            logger.info(f"📸 保存帧 {saved_count}: {frame_filename} (原始帧号: {frame_idx})")
                     else:
                         logger.error(f"❌ 保存帧失败: {frame_filename}")
                 
@@ -136,12 +152,12 @@ class VideoFrameExtractor:
                     "sample_method": sample_method,
                     "max_frames": max_frames,
                     "extracted_count": len(extracted_frames),
-                    "sample_indices": sample_indices
+                    "task_origin_dir": task_origin_dir
                 },
                 "extracted_frames": extracted_frames
             }
             
-            logger.info(f"✅ 视频帧提取完成: 提取了 {len(extracted_frames)} 帧图像")
+            logger.info(f"✅ 视频帧提取完成: 提取了 {len(extracted_frames)} 帧图像到 {task_origin_dir}")
             
             return extraction_result
             
@@ -184,18 +200,23 @@ class VideoFrameExtractor:
             帧信息列表
         """
         frames = []
+        task_origin_dir = os.path.join(self.origin_dir, task_id)
+        
+        if not os.path.exists(task_origin_dir):
+            return frames
+        
         frame_files = []
         
-        # 查找相关的帧文件
-        for filename in os.listdir(self.origin_dir):
-            if filename.startswith(f"{task_id}_frame") and filename.endswith('.jpg'):
+        # 查找帧文件
+        for filename in os.listdir(task_origin_dir):
+            if filename.startswith("frame_") and filename.endswith('.jpg'):
                 frame_files.append(filename)
         
         # 按帧号排序
-        frame_files.sort(key=lambda x: int(x.split('frame')[1].split('.')[0]))
+        frame_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
         
         for i, filename in enumerate(frame_files):
-            frame_path = os.path.join(self.origin_dir, filename)
+            frame_path = os.path.join(task_origin_dir, filename)
             if os.path.exists(frame_path):
                 # 读取图片获取尺寸信息
                 try:
@@ -228,15 +249,12 @@ class VideoFrameExtractor:
             task_id: 任务ID
         """
         try:
-            deleted_count = 0
-            for filename in os.listdir(self.origin_dir):
-                if filename.startswith(f"{task_id}_frame"):
-                    frame_path = os.path.join(self.origin_dir, filename)
-                    os.remove(frame_path)
-                    deleted_count += 1
-            
-            logger.info(f"🗑️ 清理帧文件完成: 删除了 {deleted_count} 个文件")
-            
+            task_origin_dir = os.path.join(self.origin_dir, task_id)
+            if os.path.exists(task_origin_dir):
+                # 删除目录下的所有文件
+                import shutil
+                shutil.rmtree(task_origin_dir)
+                logger.info(f"🗑️ 清理任务目录完成: {task_origin_dir}")
         except Exception as e:
             logger.error(f"清理帧文件失败: {str(e)}")
 

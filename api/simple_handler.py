@@ -32,12 +32,13 @@ class SimpleFileHandler:
         """
         self.output_dir = output_dir
         self.json_dir = os.path.join(output_dir, "json")
-        self.images_dir = os.path.join(output_dir, "images")
+        self.pose_dir = os.path.join(output_dir, "pose")  # 重命名：images -> pose
+        self.sam_dir = os.path.join(output_dir, "sam")    # 新增：SAM分割结果
         self.origin_dir = os.path.join(output_dir, "origin")
         self.temp_dir = os.path.join(output_dir, "temp")
         
         # 创建输出目录
-        for dir_path in [self.output_dir, self.json_dir, self.images_dir, self.origin_dir, self.temp_dir]:
+        for dir_path in [self.output_dir, self.json_dir, self.pose_dir, self.sam_dir, self.origin_dir, self.temp_dir]:
             os.makedirs(dir_path, exist_ok=True)
         
         # 获取RTMPose检测器和视频帧提取器
@@ -111,7 +112,7 @@ class SimpleFileHandler:
             # 绘制并保存标注图片
             annotated_image = self.detector.draw_pose_on_image(image, keypoints, scores)
             annotated_filename = f"{task_id}_frame1.jpg"
-            annotated_path = os.path.join(self.images_dir, annotated_filename)
+            annotated_path = os.path.join(self.pose_dir, annotated_filename)
             cv2.imwrite(annotated_path, annotated_image)
             
             logger.info(f"✅ 图片处理完成: JSON={json_path}, 图片={annotated_path}")
@@ -149,8 +150,8 @@ class SimpleFileHandler:
             extraction_result = self.frame_extractor.extract_frames(
                 video_path=file_path,
                 task_id=task_id,
-                max_frames=20,
-                sample_method="uniform"
+                max_frames=None,  # 提取所有帧
+                sample_method="all"  # 修改为提取所有帧
             )
             
             extracted_frames = extraction_result["extracted_frames"]
@@ -207,14 +208,47 @@ class SimpleFileHandler:
                     
                     processed_frames.append(frame_data)
                     
-                    # 保存标注图片
+                    # 为每个帧保存独立的JSON文件
+                    frame_json_result = {
+                        "task_id": task_id,
+                        "file_name": filename,
+                        "file_type": "video_frame",
+                        "frame_number": frame_number,
+                        "original_frame_index": original_frame_index,
+                        "timestamp": timestamp,
+                        "image_size": {
+                            "width": int(image.shape[1]),
+                            "height": int(image.shape[0])
+                        },
+                        "analysis_time": datetime.now().isoformat(),
+                        "num_persons": num_persons,
+                        "model_info": {
+                            "model_name": self.detector.model_name,
+                            "mode": self.detector.mode,
+                            "confidence_threshold": self.detector.confidence_threshold
+                        },
+                        "origin_image": frame_info["filename"],
+                        "persons": frame_data["persons"]
+                    }
+                    
+                    # 保存单帧JSON文件 - 使用与图片相同的命名：frame_n.json
+                    frame_json_filename = f"frame_{frame_number}.json"
+                    frame_json_path = os.path.join(self.json_dir, frame_json_filename)
+                    with open(frame_json_path, 'w', encoding='utf-8') as f:
+                        json.dump(frame_json_result, f, indent=2, ensure_ascii=False)
+                    
+                    # 保存标注图片 - 简化命名：frame_n.jpg
                     annotated_frame = self.detector.draw_pose_on_image(image, keypoints, scores)
-                    annotated_filename = f"{task_id}_frame{frame_number}.jpg"
-                    annotated_path = os.path.join(self.images_dir, annotated_filename)
+                    annotated_filename = f"frame_{frame_number}.jpg"
+                    annotated_path = os.path.join(self.pose_dir, annotated_filename)
                     cv2.imwrite(annotated_path, annotated_frame)
                     annotated_images.append(annotated_filename)
                     
-                    logger.info(f"✅ 处理帧 {frame_number}: 检测到 {num_persons} 个人 (原始帧号: {original_frame_index})")
+                    # 进度日志优化
+                    if frame_number % 100 == 0:  # 每100帧打印一次
+                        logger.info(f"✅ 已处理 {frame_number} 帧...")
+                    elif frame_number <= 10:  # 前10帧每帧都打印
+                        logger.info(f"✅ 处理帧 {frame_number}: 检测到 {num_persons} 个人 (原始帧号: {original_frame_index})")
                     
                 except Exception as e:
                     logger.error(f"❌ 处理帧 {frame_number} 失败: {str(e)}")
@@ -279,21 +313,27 @@ class SimpleFileHandler:
         """
         json_path = os.path.join(self.json_dir, f"{task_id}.json")
         
-        # 查找标注图片文件
+        # 查找标注图片文件 (frame_n.jpg格式)
         annotated_files = []
-        for filename in os.listdir(self.images_dir):
-            if filename.startswith(task_id):
+        for filename in os.listdir(self.pose_dir):
+            if filename.startswith("frame_") and filename.endswith(".jpg"):
                 annotated_files.append(filename)
         
-        # 查找原始帧文件
+        # 查找原始帧文件 (frame_n.jpg格式)
         origin_files = []
         for filename in os.listdir(self.origin_dir):
-            if filename.startswith(task_id):
+            if filename.startswith("frame_") and filename.endswith(".jpg"):
                 origin_files.append(filename)
         
         # 按帧号排序
-        annotated_files.sort(key=lambda x: int(x.split('frame')[1].split('.')[0]) if 'frame' in x else 0)
-        origin_files.sort(key=lambda x: int(x.split('frame')[1].split('.')[0]) if 'frame' in x else 0)
+        def extract_frame_number(filename):
+            try:
+                return int(filename.split('_')[1].split('.')[0])
+            except:
+                return 0
+        
+        annotated_files.sort(key=extract_frame_number)
+        origin_files.sort(key=extract_frame_number)
         
         return {
             "json_file": json_path if os.path.exists(json_path) else None,
